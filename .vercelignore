@@ -1,0 +1,4 @@
+# Tidak dibutuhkan untuk build web di Vercel (dibangun ulang di sana)
+android
+out
+.next
