@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
 import { TransformWrapper, TransformComponent, ReactZoomPanPinchContentRef } from "react-zoom-pan-pinch";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -56,6 +56,8 @@ const PLAYBACK_MODES: { id: PlaybackMode; label: string; icon: typeof Play }[] =
 // Cache lintas navigasi: data teks per halaman dan halaman yang gambarnya sudah termuat
 const pagesCache = new Map<number, QuranPageData>();
 const loadedImages = new Set<number>();
+// URL gambar yang sudah selesai dimuat di sesi ini (sudah ada di cache browser)
+const loadedUrls = new Set<string>();
 
 // Jumlah halaman yang disiapkan di kiri & kanan halaman aktif (total 5 halaman)
 const WINDOW = 2;
@@ -106,15 +108,32 @@ function MushafSlide({
     onFailed: (page: number, source: ImageSource) => void;
     onZoomChange: (zoomed: boolean) => void;
 }) {
-    const [loaded, setLoaded] = useState(false);
+    const src = IMAGE_URL[source](page);
+    // Status termuat diikat ke URL, bukan di-reset lewat effect. Saat kembali ke halaman yang
+    // sudah dibuka, gambar dari cache bisa selesai lebih dulu daripada effect; reset di effect
+    // menimpanya sehingga halaman tetap transparan (hilang).
+    const [loadedSrc, setLoadedSrc] = useState<string | null>(() => (loadedUrls.has(src) ? src : null));
+    const loaded = loadedSrc === src || loadedUrls.has(src);
+    const imgRef = useRef<HTMLImageElement>(null);
+
+    const markLoaded = useCallback(() => {
+        loadedUrls.add(src);
+        setLoadedSrc(src);
+        onLoaded(page);
+    }, [src, page, onLoaded]);
+
+    // Gambar yang sudah selesai sebelum onLoad terpasang tetap dihitung termuat
+    useLayoutEffect(() => {
+        const img = imgRef.current;
+        if (img?.complete && img.naturalWidth > 0) markLoaded();
+    }, [enabled, src, markLoaded]);
 
     // Sumber utama lambat/gagal: minta pindah ke cadangan
     useEffect(() => {
-        setLoaded(false);
-        if (!enabled || source !== "kemenag") return;
+        if (!enabled || source !== "kemenag" || loaded) return;
         const t = setTimeout(() => onFailed(page, source), SOURCE_TIMEOUT_MS);
         return () => clearTimeout(t);
-    }, [enabled, source, page, onFailed]);
+    }, [enabled, source, loaded, page, onFailed]);
 
     const isCurrent = offset === 0;
     const ref = useRef<ReactZoomPanPinchContentRef>(null);
@@ -157,17 +176,19 @@ function MushafSlide({
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     {enabled && <img
                         key={source}
-                        src={IMAGE_URL[source](page)}
+                        ref={imgRef}
+                        src={src}
                         alt={isCurrent ? `Mushaf halaman ${page}` : ""}
                         draggable={false}
                         decoding="async"
                         fetchPriority={isCurrent ? "high" : "low"}
-                        onLoad={() => {
-                            if (loaded) return;
-                            setLoaded(true);
-                            onLoaded(page);
+                        onLoad={markLoaded}
+                        onError={() => {
+                            loadedUrls.delete(src);
+                            loadedImages.delete(page);
+                            setLoadedSrc(null);
+                            onFailed(page, source);
                         }}
-                        onError={() => onFailed(page, source)}
                         className={`max-h-full max-w-full w-auto h-auto object-contain transition-opacity duration-200 ${loaded ? "opacity-100" : "opacity-0"}`}
                         style={imageStyle}
                     />}
@@ -426,7 +447,24 @@ export default function QuranPageClient({ pageNum }: QuranPageClientProps) {
     };
 
     // ---- Swipe (kanan = halaman berikutnya, seperti membalik mushaf) ----
+    // Balikan halaman yang animasinya belum selesai; diselesaikan seketika bila jari menyentuh lagi
+    const pendingTurn = useRef<{ timer: ReturnType<typeof setTimeout>; dir: 1 | -1 } | null>(null);
+    const finishTurn = (dir: 1 | -1) => {
+        pendingTurn.current = null;
+        setIsResetting(true);
+        setCurrentPage((p) => Math.min(TOTAL_PAGES, Math.max(1, p + dir)));
+        setSwipeOffset(0);
+        setTimeout(() => setIsResetting(false), 50);
+    };
+    useEffect(() => () => {
+        if (pendingTurn.current) clearTimeout(pendingTurn.current.timer);
+    }, []);
+
     const onTouchStart = (e: React.TouchEvent) => {
+        if (pendingTurn.current) {
+            clearTimeout(pendingTurn.current.timer);
+            finishTurn(pendingTurn.current.dir);
+        }
         if (isZoomed || e.touches.length > 1) return;
         setIsSwiping(true);
         touchStartX.current = e.touches[0].clientX;
@@ -464,12 +502,7 @@ export default function QuranPageClient({ pageNum }: QuranPageClientProps) {
         const threshold = width * 0.22;
         const turn = (dir: 1 | -1) => {
             setSwipeOffset(dir === 1 ? width : -width);
-            setTimeout(() => {
-                setIsResetting(true);
-                setCurrentPage((p) => p + dir);
-                setSwipeOffset(0);
-                setTimeout(() => setIsResetting(false), 50);
-            }, 260);
+            pendingTurn.current = { dir, timer: setTimeout(() => finishTurn(dir), 260) };
         };
         if (dx > threshold && currentPage < TOTAL_PAGES) turn(1);
         else if (dx < -threshold && currentPage > 1) turn(-1);
@@ -583,7 +616,8 @@ export default function QuranPageClient({ pageNum }: QuranPageClientProps) {
                             swipeOffset={swipeOffset}
                             animate={!isSwiping && !isResetting}
                             imageStyle={imageFilter}
-                            enabled={p === currentPage || currentLoaded}
+                            // Halaman yang sudah termuat tetap dipasang agar tidak dimuat ulang saat bolak-balik
+                            enabled={p === currentPage || currentLoaded || loadedImages.has(p)}
                             source={sourceOf(p)}
                             onLoaded={handleImageLoaded}
                             onFailed={handleImageFailed}
